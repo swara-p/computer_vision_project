@@ -227,7 +227,7 @@ class PoissonBlend(Blend):
 
         b = self.construct_b_vector(mask_ids,inner_pos,boundary_pos,inner_gradient_values, boundary_pixel_values)
 
-        if self.solver == "multigrid":
+        if self.solver != "multigrid":
             x = self.solver_func(A, b)
             if isinstance(x, tuple):
                 x = x[0]
@@ -244,7 +244,7 @@ class PoissonBlend(Blend):
         return poisson_blended_img
     
     def blend(self,src,tgt,mask =None):
-        self.mask = self.get_mask() if mask is None else mask
+        self.mask = self.get_mask(src) if mask is None else mask
         mask = cv2.cvtColor(self.mask,  cv2.COLOR_RGB2GRAY)
         mask = mask.astype(np.float32) / 255
         src, tgt = src.astype(float)/255, tgt.astype(float)/255

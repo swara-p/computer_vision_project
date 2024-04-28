@@ -41,7 +41,7 @@ class BruteForce(Match):
     def __init__(self, method):
         super().__init__(method)
 
-    def match_keypopints(self, featuresA, featuresB):
+    def matchKP(self, featuresA, featuresB):
         bf = self.make_matcher(check=True)
         best_matches = bf.match(featuresA,featuresB)
         rawMatches = sorted(best_matches, key = lambda x:x.distance)
