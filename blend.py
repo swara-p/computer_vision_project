@@ -9,6 +9,11 @@ import scipy.signal
 import scipy.linalg
 import scipy.sparse
 import pyamg
+import torch
+import torch.optim as optim
+
+from utils import compute_gt_gradient, make_canvas_mask, numpy2tensor, laplacian_filter_tensor, \
+                  MeanShift, Vgg16, gram_matrix
 
 
 class Blend:
@@ -274,7 +279,6 @@ class PoissonBlend(Blend):
 class PoissonBlendInBuilt(Blend):
     def __init__(self, params):
         super().__init__()
-        #self.center = params['center']
         pass 
     def get_mask(self,img):
         mask = np.zeros(img.shape, dtype=np.uint8)
@@ -300,6 +304,164 @@ class PoissonBlendInBuilt(Blend):
 
         return cv2.seamlessClone(src, tgt, mask, center, cv2.NORMAL_CLONE)
 
+class DeepBlend(Blend):
+    def __init__(self, params):
+        super().__init__()
+        self.num_steps = params['num_steps']
+        self.grad_weight = 1e4 
+        self.style_weight = 1e4 
+        self.content_weight = 1
+        self.tv_weight = 1e-6
+        self.gpu_id = 0
+        self.mse = torch.nn.MSELoss()
+        self.mean_shift = MeanShift(self.gpu_id )
+        self.vgg = Vgg16().to(self.gpu_id )
+    
+    def get_mask(self,img):
+        mask = np.zeros(img.shape, dtype=np.uint8)
+        mask[img.shape[0]//2-50:img.shape[0]//2+50, img.shape[1]//2-50:img.shape[1]//2+50] = 255
+        return mask
+    
+    def numpy_images(self,src,tgt,mask):
+        src = torch.from_numpy(src).unsqueeze(0).transpose(1,3).transpose(2,3).float().to(0)
+        tgt = torch.from_numpy(tgt).unsqueeze(0).transpose(1,3).transpose(2,3).float().to(0)
+        inpt_img = torch.randn(tgt.shape).to(0)
+
+        mask_img = numpy2tensor(mask,0)
+        mask_img = mask_img.squeeze(0).repeat(3,1).view(3,src.shape[2],src.shape[3]).unsqueeze(0)
+
+        return src, tgt, inpt_img, mask_img
+    
+    def get_optimzer(self,inpt_img):
+        optimizer = optim.LBFGS([inpt_img.requires_grad_()])
+        return optimizer
+
+    def first_pass(self,src,tgt,mask_img,canvas_mask,inpt_img,blend_img,true_grad,optimizer):
+        run = [0]
+        x_start, y_start = src.shape[2]//2, src.shape[3]//2
+        print('Entering first pass')
+        while run[0] <= self.num_steps:
+            def closure():
+                blended_img = torch.zeros(tgt.shape).to(0)
+                blended_img = inpt_img * canvas_mask + tgt * (1 - canvas_mask)
+
+                grad = laplacian_filter_tensor(blended_img,0)
+
+                grad_loss = 0
+                for i in range(len(grad)):
+                    grad_loss += self.mse(grad[i],true_grad[i])
+                grad_loss = grad_loss / len(grad)
+                grad_loss = grad_loss * self.grad_weight
+
+                # Style Loss
+                tgt_feature_style_loss =  self.vgg(self.mean_shift(tgt))
+                tgt_feature_style_gram = [gram_matrix(y) for y in tgt_feature_style_loss]
+
+                blend_feat_style_loss = self.vgg(self.mean_shift(inpt_img))
+                blend_feat_style_gram = [gram_matrix(y) for y in blend_feat_style_loss]
+
+                style_loss = 0
+                for i in range(len(blend_feat_style_gram)):
+                    style_loss += self.mse(blend_feat_style_gram[i],tgt_feature_style_gram[i])
+                style_loss = style_loss / len(blend_feat_style_gram)
+                style_loss = style_loss * self.style_weight
+
+                bended_obj = blend_img[:,:,int(x_start-src.shape[2]*0.5):int(x_start+src.shape[2]*0.5), int(y_start-src.shape[3]*0.5):int(y_start+src.shape[3]*0.5)]
+                src_obj_feat = self.vgg(self.mean_shift(src*mask_img))
+                blend_obj_feat = self.vgg(self.mean_shift(bended_obj*mask_img))
+                contnet_loss = self.content_weight*self.mse(blend_obj_feat.relu2_2,src_obj_feat.relu2_2)
+                contnet_loss = contnet_loss * self.content_weight
+
+                tv_loss = torch.sum(torch.abs(blend_img[:, :, :, :-1] - blend_img[:, :, :, 1:])) + \
+                   torch.sum(torch.abs(blend_img[:, :, :-1, :] - blend_img[:, :, 1:, :]))
+                tv_loss *= self.tv_weight
+
+                loss = grad_loss + style_loss + contnet_loss + tv_loss
+                optimizer.zero_grad()
+                loss.backward()
+
+                if run[0]%100== 0:
+                    print("Step: ", run[0], "grad_loss: ", grad_loss.item(), "style_loss: ", style_loss.item(), "content_loss: ", contnet_loss.item(), "tv_loss: ", tv_loss.item())
+                
+                run[0] += 1
+                return loss
+            
+            optimizer.step(closure)
+
+        inpt_img.data.clamp_(0, 255)
+
+        blended_img = torch.zeros(tgt.shape).to(self.gpu_id)
+        blended_img = inpt_img * canvas_mask + tgt * (1 - canvas_mask)
+        blended_img_np = blended_img.transpose(1,3).transpose(1,2).cpu().data.numpy()[0]
+
+        return blended_img_np.astype(np.uint8)
+    
+
+    def second_pass(self,first_pass_img,tgt):
+        print('Entering second pass: Optimizing the blended image')
+        self.weight = 1e7
+        first_pass_img = torch.from_numpy(first_pass_img).unsqueeze(0).transpose(1,3).transpose(2,3).float().to(self.gpu_id)
+        first_pass_img = first_pass_img.contiguous()
+        tgt = tgt.contiguous()
+        optimizer = self.get_optimzer(first_pass_img)
+        run = [0]
+        while run[0] <= self.num_steps:
+            def closure():
+                tgt_feat_style = self.vgg(self.mean_shift(tgt))
+                tgt_gram = [gram_matrix(y) for y in tgt_feat_style]
+                blended_feat_style = self.vgg(self.mean_shift(first_pass_img))
+                blend_gram = [gram_matrix(y) for y in blended_feat_style]
+
+                style_loss = 0
+                for i in range(len(blend_gram)):
+                    style_loss += self.mse(blend_gram[i], tgt_gram[i])
+                style_loss = style_loss / len(blend_gram)
+                style_loss = style_loss * self.style_weight
+
+                content_feat = self.vgg(self.mean_shift(first_pass_img))
+                content_loss = self.content_weight*self.mse(blended_feat_style.relu2_2, content_feat.relu2_2)
+
+                loss = style_loss + content_loss
+                optimizer.zero_grad()
+                loss.backward()
+
+                if run[0]%100 == 0:
+                    print("Step: ", run[0], "style_loss: ", style_loss.item(), "content_loss: ", content_loss.item())
+                
+                run[0] += 1
+                return loss
+            optimizer.step(closure)
+        
+        first_pass_img.data.clamp_(0, 255)
+        final_img = first_pass_img.transpose(1,3).transpose(1,2).cpu().data.numpy()[0]
+        return final_img.astype(np.uint8)
+
+
+    def blend(self,src,tgt,mask =None):
+        self.mask = self.get_mask() if mask is None else mask
+        mask_img = cv2.cvtColor(mask,  cv2.COLOR_RGB2GRAY)
+        mask_img[mask_img>0] = 1
+        src_shape = src.shape
+        tgt_shape = tgt.shape
+        x_start, y_start = src_shape[0]//2, src_shape[1]//2
+        
+        canvas_mask = make_canvas_mask(x_start,y_start, tgt, mask_img)
+        canvas_mask = numpy2tensor(canvas_mask,self.gpu_id)
+        canvas_mask = canvas_mask.squeeze(0).repeat(3,1).view(3,tgt_shape[0],tgt_shape[1]).unsqueeze(0)
+
+        true_gradient = compute_gt_gradient(x_start, y_start, src, tgt, mask_img,0)
+        
+        src, tgt, inpt_img, mask_img = self.numpy_images(src,tgt,mask_img)
+
+        optimizer = self.get_optimzer(inpt_img)
+
+        first_pass_img = self.first_pass(src,tgt,mask_img,canvas_mask,inpt_img,src,true_gradient,optimizer)
+
+        second_pass_img = self.second_pass(first_pass_img,tgt)
+
+        return second_pass_img
+    
+
 
 def create_blending_technique(technique_name, params):
     if technique_name == 'CutPaste':
@@ -312,12 +474,14 @@ def create_blending_technique(technique_name, params):
         return PoissonBlend(params)
     elif technique_name == 'Poisson_InBuilt':
         return PoissonBlendInBuilt(params)
+    elif technique_name == 'DeepBlend':
+        return DeepBlend(params)
 
 
 if __name__ == "__main__":
     
-    print("Select a blending technique::\n1. CutPaste\n2. Alpha\n3. MultiBand\n4. Poisson_Scratch\n5.Poisson_InBuilt")
-    choice = int(input("Enter your choice (1-5): "))
+    print("Select a blending technique::\n1. CutPaste\n2. Alpha\n3. MultiBand\n4. Poisson_Scratch\n5.Poisson_InBuilt\n6. DeepBlend\n")
+    choice = int(input("Enter your choice (1-6): "))
     params = {}
     if choice == 1:
         blending_technique = create_blending_technique('CutPaste', params)
@@ -340,6 +504,10 @@ if __name__ == "__main__":
         blending_technique = create_blending_technique('Poisson', params)
     elif choice == 5:
         blending_technique = create_blending_technique('Poisson_InBuilt', params)
+    elif choice == 6:
+        num_steps = int(input("Enter the number of steps for DeepBlend: "))
+        params['num_steps'] = num_steps
+        blending_technique = create_blending_technique('DeepBlend', params)
 
     dir = 'D:/PDFs/4th year-2nd sem/CV/computer_vision_project/test'
     out_dir = 'D:/PDFs/4th year-2nd sem/CV/computer_vision_project/output/'
