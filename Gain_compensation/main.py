@@ -56,7 +56,7 @@ from rendering import multi_band_blending, set_gain_compensations, simple_blendi
 # )
 
 # args = vars(parser.parse_args())
-args={"verbose":2,"data_dir":"img\scene1","size":None,"gain_sigma_n":10,"gain_sigma_g":0.1,"mbb_sigma":1,"num_bands":5}
+args={"verbose":2,"data_dir":"image-stitching\samples\mountain","size":None,"gain_sigma_n":10,"gain_sigma_g":0.1,"mbb_sigma":1,"num_bands":5}
 if args["verbose"]:
     logging.basicConfig(level=logging.INFO)
 
@@ -119,9 +119,9 @@ print(len(images))
 # print("Do you want gain compensantion?- Y/N")
 # answer=input()
 # if answer=='Y':
-print("Computing gain compensations...")
-for image in images:
-    image.image = (image.image * image.gain[np.newaxis, np.newaxis, :]).astype(np.uint8)
+# print("Computing gain compensations...")
+# for image in images:
+#     image.image = (image.image * image.gain[np.newaxis, np.newaxis, :]).astype(np.uint8)
 
 # print(images[0])
 # print(images[0].shape)
@@ -155,5 +155,5 @@ import os
 # Assuming 'images' is a list of NumPy arrays representing the images
 # and 'output_folder' is the path to the folder where you want to save the images
 print(len(results))
-cv2.imwrite(f'Gain_compensation\output\{method}_{match_method}_{technique}.png',results[0])
+cv2.imwrite(f'aa2\{method}_{match_method}_{technique}.png',results[0])
 
